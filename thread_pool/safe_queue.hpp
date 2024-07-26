@@ -1,0 +1,155 @@
+#pragma once
+
+#include <queue>
+#include <mutex>
+
+namespace qg {
+
+template <typename T> class safe_queue {
+
+public:
+	safe_queue() : head(new node), tail(head.get()) {}
+	~safe_queue() {
+		stop.store(true);
+		data_condition.notify_all();
+	}
+
+	safe_queue(const safe_queue&) = delete;
+	safe_queue& operator=(const safe_queue&) = delete;
+
+	bool wait_pop_timeout(T& value) {
+		std::unique_lock<std::mutex> head_lock(head_mutex);
+		auto res = data_condition.wait_for(head_lock, std::chrono::milliseconds(100), [&] { 
+            return head.get() != get_tail() || stop.load() == true; 
+        });
+		if (res == false) return false;
+		if (stop.load()) return false;
+		 
+		value = std::move(*head->data);	
+		head = std::move(head->next);
+		return true;
+	}
+
+	std::shared_ptr<T> wait_pop() {
+		std::unique_ptr<node> const old_head = wait_pop_head();
+		if (old_head == nullptr) return nullptr;
+		return old_head->data;
+	}
+
+	bool wait_pop(T& value) {
+		std::unique_ptr<node> const old_head = wait_pop_head(value);
+		if (old_head == nullptr) return false;
+		return true;
+	}
+
+	std::shared_ptr<T> try_pop() {
+		std::unique_ptr<node> old_head = try_pop_head();
+		return old_head ? old_head->data : std::shared_ptr<T>();
+	}
+
+	bool try_pop(T& value) {
+		std::unique_ptr<node> const old_head = try_pop_head(value);
+		if (old_head) return true;
+		return false;
+	}
+
+	bool empty() {
+		std::lock_guard<std::mutex> head_lock(head_mutex);
+		return (head.get() == get_tail());
+	}
+
+    void exit() {
+		stop.store(true);
+		data_condition.notify_all();
+	}
+
+	void push(T new_value) {
+		std::shared_ptr<T> new_data(std::make_shared<T>(std::move(new_value)));
+		std::unique_ptr<node> p(new node); 
+        {
+			std::lock_guard<std::mutex> tail_lock(tail_mutex);
+			tail->data = new_data;
+			node* const new_tail = p.get();
+			new_tail->prev = tail;
+			tail->next = std::move(p);
+
+			tail = new_tail;
+		}
+
+		data_cond.notify_one();
+	}
+
+	bool try_steal(T& value) {
+		std::unique_lock<std::mutex> tail_lock(tail_mutex,std::defer_lock);
+		std::unique_lock<std::mutex> head_lock(head_mutex, std::defer_lock);
+		std::lock(tail_lock, head_lock);
+		if (head.get() == tail) return false;
+
+		node* prev_node = tail->prev;
+		value = std::move(*(prev_node->data));
+		tail = prev_node;
+		tail->next = nullptr;
+		return true;
+	}
+
+private:
+	struct node {
+		std::shared_ptr<T> data;
+		std::unique_ptr<node> next;
+		node* prev;
+	};
+
+    std::unique_ptr<node> head;
+	std::mutex head_mutex;
+	node* tail;
+	std::mutex tail_mutex;
+	std::condition_variable data_condition;
+	std::atomic_bool stop;
+
+	node* get_tail() {
+		std::lock_guard<std::mutex> tail_lock(tail_mutex);
+		return tail;
+	}
+
+	std::unique_ptr<node> pop_head() {
+		std::unique_ptr<node> old_head = std::move(head);
+		head = std::move(old_head->next);
+		return old_head;
+	}
+
+	std::unique_lock<std::mutex> wait_for_data() {
+		std::unique_lock<std::mutex> head_lock(head_mutex);
+		data_condition.wait(head_lock,[&] {
+            return head.get() != get_tail() || bstop.load() == true; 
+        });
+		return std::move(head_lock);   
+	}
+
+    std::unique_ptr<node> wait_pop_head() {
+        std::unique_lock<std::mutex> head_lock(wait_for_data());   
+        if (stop.load()) return nullptr;
+        return pop_head();
+    }
+
+    std::unique_ptr<node> wait_pop_head(T& value) {
+        std::unique_lock<std::mutex> head_lock(wait_for_data());  
+        if (stop.load()) return nullptr;
+        value = std::move(*head->data);
+        return pop_head();
+    }
+
+    std::unique_ptr<node> try_pop_head() {
+        std::lock_guard<std::mutex> head_lock(head_mutex);
+        if (head.get() == get_tail()) return std::unique_ptr<node>();
+        return pop_head();
+    }
+
+    std::unique_ptr<node> try_pop_head(T& value) {
+        std::lock_guard<std::mutex> head_lock(head_mutex);
+        if (head.get() == get_tail()) return std::unique_ptr<node>();
+        value = std::move(*head->data);
+        return pop_head();
+    }
+};
+
+} // namespace qg
